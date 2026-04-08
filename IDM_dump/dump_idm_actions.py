@@ -77,7 +77,7 @@ def load_dataset_and_config(checkpoint_path, validation_dataset_path, video_indi
 
     if "gr1" in embodiment:
         embodiment_tag = EmbodimentTag.GR1_unified
-    elif "franka" in embodiment:
+    elif "franka" in embodiment or "libero" in embodiment:
         embodiment_tag = EmbodimentTag.FRANKA
     elif "so100" in embodiment:
         embodiment_tag = EmbodimentTag.SO100

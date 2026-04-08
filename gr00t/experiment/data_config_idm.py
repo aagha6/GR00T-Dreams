@@ -776,6 +776,108 @@ class FrankaDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
+###########################################################################################
+
+
+class LiberoDataConfig(BaseDataConfig):
+    video_keys = [
+        "video.image",
+        "video.wrist_image",
+    ]
+    state_keys = [
+        "state.eef_position",
+        "state.eef_rotation",
+        "state.gripper_position",
+    ]
+    action_keys = [
+        "action.eef_position_delta",
+        "action.eef_rotation_delta",
+        "action.gripper_position",
+    ]
+    language_keys = ["annotation.language.language_instruction"]
+    observation_indices = [0, 16]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # video transforms
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(apply_to=self.video_keys, height=224, width=224, interpolation="linear"),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.eef_position": "min_max",
+                    "state.gripper_position": "min_max",
+                },
+                target_rotations={
+                    "state.eef_rotation": "rotation_6d",
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.eef_position_delta": "min_max",
+                    "action.gripper_position": "min_max",
+                },
+                target_rotations={
+                    "action.eef_rotation_delta": "axis_angle",
+                },
+            ),
+            # concat transforms
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TIDMTransform(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=64,
+                max_action_dim=32,
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
 DATA_CONFIG_MAP = {
     "gr1_arms_waist": Gr1ArmsWaistDataConfig(),
     "gr1_arms_only": Gr1ArmsOnlyDataConfig(),
@@ -785,4 +887,5 @@ DATA_CONFIG_MAP = {
     "single_panda_gripper": SinglePandaGripperDataConfig(),
     "so100": So100DataConfig(),
     "franka": FrankaDataConfig(),
+    "libero": LiberoDataConfig(),
 }

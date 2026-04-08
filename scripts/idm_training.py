@@ -21,15 +21,208 @@ from pathlib import Path
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+import numpy as np
 import torch
 import tyro
-from transformers import TrainingArguments
+import yaml
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from transformers import TrainingArguments, TrainerCallback, TrainerState, TrainerControl
 
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.data.schema import EmbodimentTag
 from gr00t.experiment.data_config_idm import DATA_CONFIG_MAP
 from gr00t.experiment.runner_idm import TrainRunner
 from gr00t.model.idm import IDM
+
+
+ACTION_LABELS = ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "gripper"]
+
+
+class IDMEvalCallback(TrainerCallback):
+    """Runs inference on a few eval trajectories every eval_steps and logs plots to wandb."""
+
+    def __init__(self, model, dataset, eval_traj_ids, device, eval_steps, action_keys, batch_size=16):
+        self.model = model
+        self.dataset = dataset
+        self.eval_traj_ids = eval_traj_ids
+        self.device = device
+        self.eval_steps = eval_steps
+        self.action_keys = action_keys
+        self.batch_size = batch_size
+        # Build per-trajectory step index lookup once
+        self._step_indices = {}
+        for tid in eval_traj_ids:
+            self._step_indices[tid] = [
+                i for i, (t, _) in enumerate(dataset.all_steps) if t == tid
+            ]
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.global_step % self.eval_steps != 0:
+            return
+        try:
+            import wandb
+            from tianshou.data import Batch
+        except ImportError:
+            return
+
+        # Use the Trainer's model reference (handles DDP wrapping correctly)
+        model = kwargs.get("model", self.model)
+        # Unwrap DDP if needed
+        unwrapped = model.module if hasattr(model, "module") else model
+        unwrapped.eval()
+        figs = {}
+        with torch.no_grad():
+            for tid in self.eval_traj_ids:
+                pred_list, gt_list = [], []
+                step_indices = self._step_indices[tid]
+                for start in range(0, len(step_indices), self.batch_size):
+                    end = min(start + self.batch_size, len(step_indices))
+                    items = [self.dataset[step_indices[s]] for s in range(start, end)]
+                    batch = {}
+                    for key in items[0]:
+                        vals = [item[key] for item in items]
+                        if key == "images":
+                            batch[key] = torch.as_tensor(np.concatenate(vals), device=self.device)
+                        elif key == "view_ids":
+                            batch[key] = torch.as_tensor(np.concatenate([np.array(v) for v in vals]), device=self.device)
+                        elif isinstance(vals[0], (int, float)):
+                            batch[key] = torch.as_tensor(np.array(vals), device=self.device)
+                        elif isinstance(vals[0], np.ndarray):
+                            batch[key] = torch.as_tensor(np.stack(vals), device=self.device)
+                        elif isinstance(vals[0], torch.Tensor):
+                            batch[key] = torch.stack(vals).to(self.device)
+
+                    out = unwrapped.get_action(batch)
+                    pred = out["action_pred"].cpu()
+                    pred_raw = self.dataset.transforms.unapply(Batch(action=pred))
+
+                    # Assemble first-step predictions using known action keys
+                    pred_step = np.concatenate(
+                        [np.array(pred_raw[k])[:, 0, :] for k in self.action_keys],
+                        axis=-1,
+                    )
+                    pred_list.append(pred_step)
+
+                    if "actions" in batch:
+                        gt = batch["actions"].cpu()
+                        gt_raw = self.dataset.transforms.unapply(Batch(action=gt))
+                        gt_step = np.concatenate(
+                            [np.array(gt_raw[k])[:, 0, :] for k in self.action_keys],
+                            axis=-1,
+                        )
+                        gt_list.append(gt_step)
+
+                pred_arr = np.concatenate(pred_list, axis=0)
+                gt_arr = np.concatenate(gt_list, axis=0) if gt_list else None
+
+                n_dims = pred_arr.shape[1]
+                labels = ACTION_LABELS[:n_dims]
+                fig, axes = plt.subplots(n_dims, 1, figsize=(12, 2 * n_dims), sharex=True)
+                fig.suptitle(f"Step {state.global_step} — Traj {tid}", fontsize=11)
+                for i, ax in enumerate(axes):
+                    ax.plot(pred_arr[:, i], label="pred", alpha=0.85)
+                    if gt_arr is not None:
+                        ax.plot(gt_arr[:, i], label="gt", linestyle="--", alpha=0.85)
+                    ax.set_ylabel(labels[i] if i < len(labels) else f"dim{i}", fontsize=8)
+                    if i == 0:
+                        ax.legend(fontsize=7)
+                axes[-1].set_xlabel("Step")
+                plt.tight_layout()
+                figs[f"eval/traj_{tid}"] = wandb.Image(fig)
+                plt.close(fig)
+
+        if wandb.run is not None:
+            wandb.log(figs, step=state.global_step)
+
+        unwrapped.train()
+
+
+def save_conf_yaml(output_dir: str, data_config_name: str):
+    """Generate and save a conf.yaml compatible with dump_idm_actions.py."""
+    data_cfg = DATA_CONFIG_MAP[data_config_name]
+    video_keys = data_cfg.video_keys
+    state_keys = data_cfg.state_keys
+    action_keys = data_cfg.action_keys
+    language_keys = data_cfg.language_keys
+    obs_indices = data_cfg.observation_indices
+    action_indices = data_cfg.action_indices
+
+    # Build modality_configs section
+    modality_configs = {
+        data_config_name: {
+            "video": {
+                "_target_": "gr00t.data.dataset.ModalityConfig",
+                "delta_indices": obs_indices,
+                "modality_keys": video_keys,
+            },
+            "state": {
+                "_target_": "gr00t.data.dataset.ModalityConfig",
+                "delta_indices": obs_indices,
+                "modality_keys": state_keys,
+            },
+            "action": {
+                "_target_": "gr00t.data.dataset.ModalityConfig",
+                "delta_indices": action_indices,
+                "modality_keys": action_keys,
+            },
+            "language": {
+                "_target_": "gr00t.data.dataset.ModalityConfig",
+                "delta_indices": obs_indices,
+                "modality_keys": language_keys,
+            },
+        }
+    }
+
+    # Reconstruct transforms list from data_config class attributes
+    state_transform = data_cfg.transform()
+    # Extract normalization_modes and target_rotations by inspecting the transform chain
+    state_norm_modes = {}
+    state_rot = {}
+    action_norm_modes = {}
+    action_rot = {}
+    for t in state_transform.transforms:
+        cls_name = type(t).__name__
+        if cls_name == "StateActionTransform":
+            keys = t.apply_to
+            if keys and keys[0].startswith("state."):
+                state_norm_modes = {k: v for k, v in (t.normalization_modes or {}).items()}
+                state_rot = {k: v for k, v in (t.target_rotations or {}).items()}
+            elif keys and keys[0].startswith("action."):
+                action_norm_modes = {k: v for k, v in (t.normalization_modes or {}).items()}
+                action_rot = {k: v for k, v in (t.target_rotations or {}).items()}
+
+    transforms_list = [
+        {"_target_": "gr00t.data.transform.video.VideoToTensor", "apply_to": video_keys},
+        {"_target_": "gr00t.data.transform.video.VideoCrop", "apply_to": video_keys, "scale": 0.95},
+        {"_target_": "gr00t.data.transform.video.VideoResize", "apply_to": video_keys, "height": 224, "width": 224, "interpolation": "linear"},
+        {"_target_": "gr00t.data.transform.video.VideoColorJitter", "apply_to": video_keys, "brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08},
+        {"_target_": "gr00t.data.transform.video.VideoToNumpy", "apply_to": video_keys},
+        {"_target_": "gr00t.data.transform.state_action.StateActionToTensor", "apply_to": state_keys},
+        {"_target_": "gr00t.data.transform.state_action.StateActionTransform", "apply_to": state_keys, "normalization_modes": state_norm_modes, "target_rotations": state_rot},
+        {"_target_": "gr00t.data.transform.state_action.StateActionToTensor", "apply_to": action_keys},
+        {"_target_": "gr00t.data.transform.state_action.StateActionTransform", "apply_to": action_keys, "normalization_modes": action_norm_modes, "target_rotations": action_rot},
+        {"_target_": "gr00t.data.transform.concat.ConcatTransform", "video_concat_order": video_keys, "state_concat_order": state_keys, "action_concat_order": action_keys},
+        {"_target_": "gr00t.model.transforms_idm.GR00TIDMTransform", "state_horizon": len(obs_indices), "action_horizon": len(action_indices), "max_state_dim": 64, "max_action_dim": 32},
+    ]
+
+    conf = {
+        "modality_configs": modality_configs,
+        "all_transforms": {
+            data_config_name: {
+                "_target_": "gr00t.data.transform.base.ComposedModalityTransform",
+                "transforms": transforms_list,
+            }
+        },
+        "metadata_versions": {data_config_name: "1.0"},
+    }
+
+    conf_path = Path(output_dir) / "experiment_cfg" / "conf.yaml"
+    conf_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(conf_path, "w") as f:
+        yaml.dump(conf, f, default_flow_style=False, sort_keys=False)
+    print(f"Saved conf.yaml to {conf_path}")
 
 @dataclass
 class Config:
@@ -89,6 +282,12 @@ class Config:
 
     random_init: bool = False
     """Whether to random init the model except action_head_cfg.siglip_model_cfg"""
+
+    eval_steps: int = 500
+    """Log eval plots to wandb every N steps (0 to disable)."""
+
+    eval_num_trajs: int = 3
+    """Number of trajectories to use for eval plots."""
 
 
 #####################################################################################
@@ -181,8 +380,13 @@ def main(config: Config):
         resume_from_checkpoint=config.resume,
     )
 
-    # 2.3 run experiment
+    # 2.4 run experiment
     experiment.train()
+
+    # 2.4 save conf.yaml for dump_idm_actions.py compatibility
+    rank = int(os.environ.get("RANK", 0))
+    if rank == 0:
+        save_conf_yaml(config.output_dir, config.data_config)
 
 
 if __name__ == "__main__":
