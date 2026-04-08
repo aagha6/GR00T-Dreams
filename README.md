@@ -80,6 +80,64 @@ PYTHONPATH=. torchrun scripts/idm_training.py --dataset-path <path_to_dataset> -
 ```
 For other embodiments, you need to add two things: 1)`modality.json` and `stats.json` below `IDM_dump/global_metadata/{embodiment_name}`, 2) data config information for the new embodiment below `gr00t/experiment/data_config_idm.py`.
 
+#### LIBERO Spatial Example
+
+##### Preprocessing LIBERO Spatial data
+The LIBERO Spatial dataset (`lerobot/libero_spatial_image`) is distributed in LeRobot v3 format (chunked parquets with images stored as raw bytes). The following steps convert it to the v2 format required by `LeRobotSingleDataset`:
+
+1. Download the dataset from HuggingFace:
+```bash
+huggingface-cli download lerobot/libero_spatial_image --repo-type dataset --local-dir data/libero_spatial_raw
+```
+
+2. Convert from v3 to v2 format:
+   - Split the chunked parquets into per-episode `episode_XXXXXX.parquet` files
+   - Decode per-frame image bytes from each parquet and re-encode as H.264 MP4 per episode per camera (`image` and `wrist_image`)
+   - Create `meta/info.json`, `meta/episodes.jsonl`
+   - Map `task_index` values to task description strings and add `annotation.language.language_instruction` column to each episode parquet
+
+3. Create `meta/modality.json` with the following content:
+```json
+{
+    "state": {
+        "eef_position": {"start": 0, "end": 3},
+        "eef_rotation": {"start": 3, "end": 6, "rotation_type": "axis_angle"},
+        "gripper_position": {"start": 6, "end": 8}
+    },
+    "action": {
+        "eef_position_delta": {"start": 0, "end": 3, "absolute": false},
+        "eef_rotation_delta": {"start": 3, "end": 6, "rotation_type": "euler_angles_rpy", "absolute": false},
+        "gripper_position": {"start": 6, "end": 7}
+    },
+    "video": {
+        "image": {"original_key": "observation.images.image"},
+        "wrist_image": {"original_key": "observation.images.wrist_image"}
+    },
+    "annotation": {"language.language_instruction": {}}
+}
+```
+
+##### Training IDM on LIBERO Spatial
+```bash
+PYTHONPATH=. torchrun --nproc_per_node=1 scripts/idm_training.py \
+    --dataset-path data/libero_spatial_v2 \
+    --data-config libero \
+    --embodiment_tag franka \
+    --output_dir checkpoints/idm_libero_spatial \
+    --batch_size 16 \
+    --max_steps 10000 \
+    --learning_rate 1e-5
+```
+
+##### Evaluating the trained IDM
+```bash
+PYTHONPATH=. python scripts/test_idm_libero.py \
+    --checkpoint checkpoints/idm_libero_spatial \
+    --dataset data/libero_spatial_v2 \
+    --num_trajs 3 \
+    --output_dir results/idm_libero
+```
+
 
 ## 4. Fine-tuning on GR00T N1
 
