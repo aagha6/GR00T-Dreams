@@ -878,6 +878,10 @@ class LiberoDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
+class LiberoAgentviewDataConfig(LiberoDataConfig):
+    video_keys = ["video.image"]
+
+
 DATA_CONFIG_MAP = {
     "gr1_arms_waist": Gr1ArmsWaistDataConfig(),
     "gr1_arms_only": Gr1ArmsOnlyDataConfig(),
@@ -888,4 +892,5 @@ DATA_CONFIG_MAP = {
     "so100": So100DataConfig(),
     "franka": FrankaDataConfig(),
     "libero": LiberoDataConfig(),
+    "libero_agentview": LiberoAgentviewDataConfig(),
 }

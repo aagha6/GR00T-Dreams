@@ -142,6 +142,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="checkpoints/idm_libero_spatial")
     parser.add_argument("--dataset", default="data/libero_spatial_v2")
+    parser.add_argument("--data_config", default="libero")
     parser.add_argument("--num_trajs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--output_dir", default="results/idm_libero")
@@ -157,7 +158,7 @@ def main():
     model.to(args.device)
     print("Model loaded.")
 
-    data_config = DATA_CONFIG_MAP["libero"]
+    data_config = DATA_CONFIG_MAP[args.data_config]
     dataset = LeRobotSingleDataset(
         dataset_path=args.dataset,
         modality_configs=data_config.modality_config(),
